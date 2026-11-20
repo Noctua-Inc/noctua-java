@@ -1,5 +1,6 @@
 package noctua;
 
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.cdimascio.dotenv.Dotenv;
 
 import noctua.bd.DBConnectionProvider;
@@ -9,6 +10,7 @@ import noctua.logs.GerarLogs;
 import noctua.s3.S3Provider;
 
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -24,13 +26,13 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 
 public class Main {
 
@@ -50,15 +52,13 @@ public class Main {
         DBConnectionProvider dbConnectionProvider = new DBConnectionProvider();
         JdbcTemplate conexao = dbConnectionProvider.getConnection();
         List<Mainframe> mainframes;
-        Map<String, Integer> empresas = new LinkedHashMap<>();
+        List<Empresa> empresas = new ArrayList<>();
 
         try {
-            var linhasEmpresa = conexao.queryForList("SELECT id_empresa, razao_social FROM empresa");
-            for (Map<String, Object> linha : linhasEmpresa) {
-                String pasta = ((String) linha.get("razao_social")).toLowerCase(Locale.ROOT).replace(' ', '_');
-                if (empresas.putIfAbsent(pasta, ((Number) linha.get("id_empresa")).intValue()) != null) {
-                    empresas.put(pasta, 0);
-                }
+            List<Empresa> linhasEmpresa = conexao.query(
+                    "SELECT id_empresa, razao_social FROM empresa", new EmpresaMapper());
+            for (Empresa empresa : linhasEmpresa) {
+                adicionarEmpresa(empresas, empresa);
             }
             mainframes = conexao.query(
                     "SELECT m.id_mainframe, m.fk_empresa, m.hostname, " +
@@ -67,15 +67,7 @@ public class Main {
                             "JOIN parametro p ON p.id_mainframe = m.id_mainframe " +
                             "JOIN componente c ON c.id_componente = p.id_componente",
 
-                    (m, linha) -> new Mainframe(
-                            m.getInt("id_mainframe"),
-                            m.getInt("fk_empresa"),
-                            m.getString("hostname"),
-                            m.getInt("id_componente"),
-                            m.getString("tipo"),
-                            m.getInt("pico_min"),
-                            m.getInt("pico_max")
-                    )
+                    new MainframeMapper()
             );
         } catch (Exception e) {
             System.err.println(
@@ -91,12 +83,12 @@ public class Main {
         int lotesConcluidos = 0;
         int totalAlertas = 0;
         try (S3Client s3Client = new S3Provider().getS3Client()) {
-            for (Map.Entry<String, Integer> empresa : empresas.entrySet()) {
-                if (empresa.getValue() == 0) {
-                    System.err.println("Pasta Silver ambígua para a empresa: " + empresa.getKey());
+            for (Empresa empresa : empresas) {
+                if (empresa.id == 0 || empresa.pastaAmbigua) {
+                    System.err.println("Pasta Silver ambígua para a empresa: " + empresa.pasta);
                     continue;
                 }
-                String prefixo = empresa.getKey() + "/02-silver/";
+                String prefixo = empresa.pasta + "/02-silver/";
                 System.out.println("Consultando prefixo Silver: " + prefixo);
                 int lotesEncontrados = 0;
                 ListObjectsV2Request requisicao = ListObjectsV2Request.builder()
@@ -109,8 +101,8 @@ public class Main {
                         continue;
                     }
                     lotesEncontrados++;
-                    int quantidadeAlertas = processarLote(s3Client, jira, bucketName, empresa.getKey(),
-                            chave, hostname, empresa.getValue(), mainframes);
+                    int quantidadeAlertas = processarLote(s3Client, jira, bucketName, empresa,
+                            chave, hostname, mainframes);
                     if (quantidadeAlertas >= 0) {
                         lotesConcluidos++;
                         totalAlertas += quantidadeAlertas;
@@ -128,11 +120,58 @@ public class Main {
         System.out.println("\nProcessamento finalizado. Lotes lidos: " + lotesConcluidos + " | Alertas: " + totalAlertas);
     }
 
-    static int processarLote(S3Client s3, Jira jira, String bucket, String empresa, String chave,
-                            String hostname, int idEmpresa, List<Mainframe> mainframes)
+    private static void adicionarEmpresa(List<Empresa> empresas, Empresa novaEmpresa) {
+        for (Empresa empresa : empresas) {
+            if (empresa.pasta.equals(novaEmpresa.pasta)) {
+                empresa.pastaAmbigua = true;
+                return;
+            }
+        }
+        empresas.add(novaEmpresa);
+    }
+
+    private static class Empresa {
+        private final int id;
+        private final String pasta;
+        private final String razaoSocial;
+        private boolean pastaAmbigua;
+
+        private Empresa(int id, String pasta, String razaoSocial) {
+            this.id = id;
+            this.pasta = pasta;
+            this.razaoSocial = razaoSocial;
+        }
+    }
+
+    private static class EmpresaMapper implements RowMapper<Empresa> {
+        @Override
+        public Empresa mapRow(ResultSet linha, int numeroLinha) throws SQLException {
+            String razaoSocial = linha.getString("razao_social");
+            String pasta = razaoSocial.toLowerCase(Locale.ROOT).replace(' ', '_');
+            return new Empresa(linha.getInt("id_empresa"), pasta, razaoSocial);
+        }
+    }
+
+    private static class MainframeMapper implements RowMapper<Mainframe> {
+        @Override
+        public Mainframe mapRow(ResultSet linha, int numeroLinha) throws SQLException {
+            return new Mainframe(
+                    linha.getInt("id_mainframe"),
+                    linha.getInt("fk_empresa"),
+                    linha.getString("hostname"),
+                    linha.getInt("id_componente"),
+                    linha.getString("tipo"),
+                    linha.getInt("pico_min"),
+                    linha.getInt("pico_max")
+            );
+        }
+    }
+
+    private static int processarLote(S3Client s3, Jira jira, String bucket, Empresa empresa, String chave,
+                                   String hostname, List<Mainframe> mainframes)
             throws InterruptedException {
         String nome = chave.substring(chave.lastIndexOf('/') + 1, chave.length() - ".csv".length());
-        String marcador = empresa + "/04-controle/" + hostname + "/" + nome + ".concluido";
+        String marcador = empresa.pasta + "/04-controle/" + hostname + "/" + nome + ".concluido";
         if (marcadorExiste(s3, bucket, marcador)) {
             System.out.println("Lote já processado: " + chave);
             return -1;
@@ -141,11 +180,21 @@ public class Main {
         System.out.println("Processando arquivo: " + chave);
         GetObjectRequest download = GetObjectRequest.builder().bucket(bucket).key(chave).build();
         List<String> alertas;
+        ArrayNode alertasGold = AlertasGold.novoArray();
         try (BufferedReader leitor = new BufferedReader(new InputStreamReader(
                 s3.getObject(download), StandardCharsets.UTF_8))) {
-            alertas = processarCsv(leitor, chave, hostname, idEmpresa, mainframes);
+            alertas = processarCsv(leitor, chave, hostname, empresa.id, mainframes,
+                    empresa.razaoSocial, alertasGold);
         } catch (IOException e) {
             System.err.println("Erro ao processar " + chave + ": " + e.getMessage());
+            return -1;
+        }
+
+        String chaveGold = empresa.pasta + "/03-gold/alertas.json";
+        try {
+            AlertasGold.atualizar(s3, bucket, chaveGold, alertasGold);
+        } catch (IOException | SdkException e) {
+            System.err.println("Erro ao atualizar s3://" + bucket + "/" + chaveGold + ": " + e.getMessage());
             return -1;
         }
 
@@ -187,7 +236,8 @@ public class Main {
         if (!chave.startsWith(prefixo)) {
             return null;
         }
-        String[] partes = chave.substring(prefixo.length()).split("/", -1);
+        String caminhoLote = chave.substring(prefixo.length());
+        String[] partes = caminhoLote.split("/", -1);
         if (partes.length != 2 || partes[0].isBlank()) {
             return null;
         }
@@ -201,7 +251,8 @@ public class Main {
     }
 
     static List<String> processarCsv(BufferedReader leitor, String chave, String hostnamePasta,
-                                    int idEmpresa, List<Mainframe> mainframes) throws IOException {
+                                    int idEmpresa, List<Mainframe> mainframes,
+                                    String razaoSocial, ArrayNode alertasGold) throws IOException {
         List<String> alertas = new ArrayList<>();
         String cabecalho = leitor.readLine();
         if (cabecalho == null) {
@@ -216,7 +267,9 @@ public class Main {
         if (colunaHost < 0 || colunaCpu < 0 || colunaRam < 0 || colunaDisco < 0) {
             throw new IOException("Cabeçalho de métricas inválido.");
         }
-        int ultimaColuna = Math.max(Math.max(colunaHost, colunaCpu), Math.max(colunaRam, colunaDisco));
+        int ultimaColuna = Math.max(colunaHost, colunaCpu);
+        ultimaColuna = Math.max(ultimaColuna, colunaRam);
+        ultimaColuna = Math.max(ultimaColuna, colunaDisco);
 
         String linha;
         int numeroLinha = 1;
@@ -340,6 +393,8 @@ public class Main {
                     }
 
                     alertas.add(alerta);
+                    AlertasGold.adicionar(alertasGold, chave, mainframe.getIdMainframe(),
+                            hostname, tipo, valor, minimo, maximo, razaoSocial);
 
                     System.out.println("ALERTA: " + alerta);
 
